@@ -4,8 +4,18 @@
 //! 1. Hardware attestation (AMD SEV-SNP)
 //! 2. Sigstore verification (code provenance)
 //! 3. Measurement comparison (code matches enclave)
+//!
+//! Architecture:
+//!   Client → Confidential Model Router (enclave) → Model Enclaves
+//!            inference.tinfoil.sh                   qwen3-coder, nomic-embed, etc.
+//!
+//! We verify the ROUTER, which internally verifies each model enclave.
 
 use tinfoil::attestation;
+
+// The confidential model router - all API requests go through here
+const ROUTER_HOST: &str = "inference.tinfoil.sh";
+const ROUTER_REPO: &str = "tinfoilsh/confidential-model-router";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,19 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║      Tinfoil Full End-to-End Verification Demo               ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
     
-    // The enclave we're verifying - use inference.tinfoil.sh (the model router)
-    let host = "inference.tinfoil.sh";
-    // Note: The router runs different code than individual model enclaves
-    // For a real verification, you'd match the host to its repo
-    let repo = "tinfoilsh/confidential-llama3-3-70b";
+    println!("Router host: {}", ROUTER_HOST);
+    println!("Router repo: {}\n", ROUTER_REPO);
     
-    println!("Enclave host: {}", host);
-    println!("Source repo:  {}\n", repo);
+    println!("Architecture:");
+    println!("  Client → Router (enclave) → Model Enclaves");
+    println!("           ↑ we verify this    ↑ router verifies these\n");
     
     // Step 1: Hardware Attestation
     println!("═══ Step 1: Hardware Attestation ═══");
-    println!("   → Fetching attestation from enclave...");
-    let doc = attestation::fetch(host).await?;
+    println!("   → Fetching attestation from router enclave...");
+    let doc = attestation::fetch(ROUTER_HOST).await?;
     println!("   ✓ Received {:?} attestation", doc.format);
     
     println!("   → Verifying AMD SEV-SNP report...");
@@ -35,50 +43,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ ASK signature verified against ARK");
     println!("   ✓ VCEK signature verified against ASK");
     println!("   ✓ Report signature verified against VCEK (ECDSA P-384)");
-    println!("   Enclave measurement: {}...", &enclave.measurement.registers[0][..48]);
+    println!("   Router measurement: {}...", &enclave.measurement.registers[0][..48]);
     
     // Step 2: Sigstore Verification
     println!("\n═══ Step 2: Sigstore Verification ═══");
     println!("   → Fetching latest release from GitHub...");
-    let tag = tinfoil::sigstore::fetch_latest_tag(repo).await?;
+    let tag = tinfoil::sigstore::fetch_latest_tag(ROUTER_REPO).await?;
     println!("   ✓ Latest release: {}", tag);
     
     println!("   → Fetching attestation bundle...");
-    let digest = tinfoil::sigstore::fetch_digest(repo, &tag).await?;
+    let digest = tinfoil::sigstore::fetch_digest(ROUTER_REPO, &tag).await?;
     println!("   ✓ Digest: {}...", &digest[..32]);
     
     println!("   → Verifying Sigstore bundle...");
-    let code_measurement = tinfoil::sigstore::verify_repo(repo).await?;
+    let code_measurement = tinfoil::sigstore::verify_repo(ROUTER_REPO).await?;
     println!("   ✓ DSSE signature verified (ECDSA P-256)");
     println!("   ✓ Certificate issuer: GitHub Actions");
-    println!("   ✓ Certificate repository: matches expected");
+    println!("   ✓ Certificate repository: {}", ROUTER_REPO);
     println!("   Source measurement: {}...", &code_measurement.registers[0][..48]);
     
     // Step 3: Consistency Check
     println!("\n═══ Step 3: Consistency Verification ═══");
-    println!("   Enclave: {}...", &enclave.measurement.registers[0][..48]);
-    println!("   Source:  {}...", &code_measurement.registers[0][..48]);
+    println!("   Router enclave: {}...", &enclave.measurement.registers[0][..48]);
+    println!("   Source code:    {}...", &code_measurement.registers[0][..48]);
     print!("   → Comparing measurements... ");
     
-    // Note: The router (inference.tinfoil.sh) runs different code than the model enclave
-    // (confidential-llama3-3-70b), so measurements won't match in this demo.
-    // In production, you'd verify each enclave against its own repo.
     match enclave.measurement.equals(&code_measurement) {
         Ok(()) => {
             println!("✓ MATCH!");
             println!("\n╔══════════════════════════════════════════════════════════════╗");
             println!("║                    ✅ VERIFICATION PASSED                    ║");
             println!("╠══════════════════════════════════════════════════════════════╣");
-            println!("║  The enclave is running the exact code published on GitHub.  ║");
-            println!("║  Hardware attestation + Sigstore = Zero-trust verification.  ║");
+            println!("║  The router is running the exact code from GitHub.           ║");
+            println!("║  All requests through this router are verified.              ║");
             println!("╚══════════════════════════════════════════════════════════════╝");
         }
         Err(e) => {
             println!("✗ Different");
-            println!("\n   Note: This is expected! The inference router runs different");
-            println!("   code than the model enclave. In production, you would verify");
-            println!("   each enclave against its specific repository.");
-            println!("\n   Error details: {}", e);
+            println!("\n   Error: {}", e);
+            println!("\n   Possible reasons:");
+            println!("   • Router was recently updated (fetch latest release)");
+            println!("   • Network returned stale attestation (retry)");
         }
     }
     
@@ -90,11 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("      • Report signature: ECDSA P-384 verified");
     println!("   ✅ Step 2: Sigstore verification passed");
     println!("      • DSSE envelope: ECDSA P-256 verified");
-    println!("      • Certificate: GitHub Actions for correct repo");
-    println!("   ⚠️  Step 3: Measurements differ (expected for router vs model)");
-    println!("\n   TLS fingerprint:    {}...", &enclave.tls_public_key_fp[..32]);
+    println!("      • Certificate: GitHub Actions for {}", ROUTER_REPO);
+    
+    println!("\n═══ Available Models (via verified router) ═══");
+    println!("   • qwen3-coder-480b  - Advanced coding (480B MoE)");
+    println!("   • nomic-embed-text  - Embeddings (768 dimensions)");
+    println!("   • docling           - Document processing");
+    println!("   • llama3-3-70b      - General chat");
+    println!("   • deepseek-r1-0528  - Advanced reasoning");
+    
+    println!("\n   TLS fingerprint: {}...", &enclave.tls_public_key_fp[..32]);
     if let Some(hpke) = &enclave.hpke_public_key {
-        println!("   HPKE public key:    {}...", &hpke[..32]);
+        println!("   HPKE public key: {}...", &hpke[..32]);
     }
     
     Ok(())

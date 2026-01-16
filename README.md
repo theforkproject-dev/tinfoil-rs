@@ -9,7 +9,7 @@ A production-ready Rust SDK for [Tinfoil](https://tinfoil.sh) secure enclaves wi
 - **TLS Certificate Pinning** - Connections are bound to attested enclave certificates
 - **Full Sigstore Verification** - DSSE signatures prove code came from GitHub Actions
 - **No OpenSSL** - Pure Rust cryptography, no system dependencies
-- **OpenAI-Compatible API** - Drop-in replacement for chat and embedding endpoints
+- **OpenAI-Compatible API** - Drop-in replacement for chat, embedding, and document endpoints
 
 ## Installation
 
@@ -20,44 +20,78 @@ Add to your `Cargo.toml`:
 tinfoil = { git = "https://github.com/theforkproject-dev/tinfoil-rs" }
 ```
 
+## Architecture
+
+Tinfoil uses a **Confidential Model Router** architecture:
+
+```
+Client → Confidential Model Router (enclave) → Model Enclaves (enclaves)
+         inference.tinfoil.sh                   qwen3-coder, nomic-embed, etc.
+```
+
+Both the router AND model enclaves run in AMD SEV-SNP secure enclaves. When you verify `inference.tinfoil.sh`, you're verifying the router which internally verifies each model enclave before routing requests.
+
+**Router Repository:** [`tinfoilsh/confidential-model-router`](https://github.com/tinfoilsh/confidential-model-router)
+
 ## Quick Start
 
 ```rust
-use tinfoil::{attestation, sigstore, SecureClient};
+use tinfoil::{attestation, sigstore, SecureClient, ChatMessage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Verify hardware attestation
+    // Step 1: Verify the router enclave hardware
     let doc = attestation::fetch("inference.tinfoil.sh").await?;
     let enclave = attestation::verify_full(&doc).await?;
     println!("✓ Hardware attestation verified");
     
-    // Step 2: Verify code provenance
-    let source = sigstore::verify_repo("tinfoilsh/model-repo").await?;
+    // Step 2: Verify router code provenance
+    let source = sigstore::verify_repo("tinfoilsh/confidential-model-router").await?;
     println!("✓ Sigstore verification passed");
     
     // Step 3: Compare measurements
     enclave.measurement.equals(&source)?;
-    println!("✓ Enclave runs published code");
+    println!("✓ Router runs published code");
     
-    // Create verified client and make requests
+    // Create verified client - all requests go through attested router
     let mut client = SecureClient::new("inference.tinfoil.sh", "your-api-key");
     client.verify().await?;
     
-    let response = client.chat(vec![
-        tinfoil::ChatMessage::user("What is 2+2?")
-    ]).await?;
-    
+    // Chat with qwen3-coder-480b
+    let response = client.chat_with_model("qwen3-coder-480b", vec![
+        ChatMessage::user("What is 2+2?")
+    ], None).await?;
     println!("Response: {}", response.choices[0].message.content);
+    
+    // Generate embeddings with nomic-embed-text
+    let embedding = client.embed("text to embed").await?;
+    println!("Embedding: {} dimensions", embedding.len());
+    
     Ok(())
 }
 ```
+
+## Supported Models
+
+All requests go through the verified router at `inference.tinfoil.sh`:
+
+| Model ID | Type | Use Case |
+|----------|------|----------|
+| `qwen3-coder-480b` | Chat/Code | Advanced coding, 480B MoE (35B active), 128K context |
+| `nomic-embed-text` | Embedding | Semantic search, 768 dimensions, 8K context |
+| `docling` | Document | PDF/Word processing, text extraction |
+| `llama3-3-70b` | Chat | General conversation, 128K context |
+| `deepseek-r1-0528` | Chat | Advanced reasoning, 671B parameters |
+| `qwen3-vl-30b` | Vision | Image/video analysis, 256K context |
+| `whisper-large-v3-turbo` | Audio | Speech-to-text transcription |
+
+See [Tinfoil Model Catalog](https://docs.tinfoil.sh/models/catalog) for full details.
 
 ## Three-Step Verification
 
 ### Step 1: Hardware Attestation (AMD SEV-SNP)
 
-Verifies the enclave runs on genuine AMD hardware with encrypted memory:
+Verifies the router enclave runs on genuine AMD hardware with encrypted memory:
 
 - **ARK pinning** - AMD root key fingerprint is hardcoded
 - **ARK self-signature** - RSA-PSS SHA-384 verified
@@ -68,86 +102,77 @@ Verifies the enclave runs on genuine AMD hardware with encrypted memory:
 ```rust
 let doc = attestation::fetch("inference.tinfoil.sh").await?;
 let enclave = attestation::verify_full(&doc).await?;
-// enclave.measurement, enclave.tls_public_key_fp, enclave.hpke_public_key
 ```
 
 ### Step 2: Sigstore Verification (Code Provenance)
 
-Proves the code was built by GitHub Actions from the public repository:
+Proves the router code was built by GitHub Actions:
 
 - **DSSE signature** - ECDSA P-256 over PAE-encoded payload
 - **Certificate validation** - Issuer must be GitHub Actions
-- **Repository check** - Certificate must be for expected repo
+- **Repository check** - Must be `tinfoilsh/confidential-model-router`
 
 ```rust
-let measurement = sigstore::verify_repo("tinfoilsh/model-repo").await?;
+let source = sigstore::verify_repo("tinfoilsh/confidential-model-router").await?;
+enclave.measurement.equals(&source)?;
 ```
 
 ### Step 3: TLS Certificate Pinning
 
-Binds connections to the attested enclave, preventing MITM attacks:
-
-- **SPKI fingerprint** - SHA-256 of certificate's SubjectPublicKeyInfo
-- **Chain validation** - Standard CA verification still applies
+Binds connections to the attested router, preventing MITM attacks:
 
 ```rust
 let mut client = SecureClient::new("inference.tinfoil.sh", "api-key");
 client.verify().await?;  // Sets up pinned TLS
-// All subsequent requests use pinned connection
+// All subsequent requests use pinned connection to verified router
+```
+
+## Chain of Trust
+
+When verification passes:
+
+1. **You verify the router** - AMD hardware attestation + Sigstore code provenance
+2. **Router verifies model enclaves** - Internal attestation before routing
+3. **End-to-end encryption** - TLS pinned to attested certificates
+
+Your data flows through verified enclaves at every step. Not even Tinfoil can access your prompts or responses.
+
+## API Reference
+
+### Chat (qwen3-coder-480b)
+
+```rust
+let response = client.chat_with_model("qwen3-coder-480b", vec![
+    ChatMessage::system("You are a helpful coding assistant"),
+    ChatMessage::user("Write a Rust function to sort a vector")
+], None).await?;
+```
+
+### Embeddings (nomic-embed-text)
+
+```rust
+let embedding = client.embed("text to generate embedding for").await?;
+// Returns Vec<f32> with 768 dimensions
+```
+
+### Document Processing (docling)
+
+```rust
+// Coming soon - document upload and processing API
 ```
 
 ## Security Model
-
-When verification passes, you have cryptographic proof that:
 
 | Guarantee | How It's Verified |
 |-----------|-------------------|
 | Hardware is genuine | AMD ARK signature chain (pinned root) |
 | Memory is encrypted | SEV-SNP attestation |
-| Code is auditable | Sigstore measurement matches |
+| Router code is auditable | Sigstore measurement matches |
 | Build is legitimate | GitHub Actions certificate |
 | Connection is secure | TLS pinned to attested key |
+| Model enclaves verified | Router performs internal attestation |
 
-**An attacker would need AMD's private keys to forge attestation.** That's the correct security model.
-
-## API Reference
-
-### Attestation
-
-```rust
-// Fetch attestation document
-let doc = attestation::fetch("host.tinfoil.sh").await?;
-
-// Full verification with certificate chain
-let enclave = attestation::verify_full(&doc).await?;
-```
-
-### Sigstore
-
-```rust
-// Full cryptographic verification
-let measurement = sigstore::verify_repo("org/repo").await?;
-
-// Individual steps (if needed)
-let tag = sigstore::fetch_latest_tag("org/repo").await?;
-let digest = sigstore::fetch_digest("org/repo", &tag).await?;
-```
-
-### SecureClient
-
-```rust
-let mut client = SecureClient::new("inference.tinfoil.sh", "api-key");
-client.verify().await?;
-
-// Chat API
-let response = client.chat(vec![
-    ChatMessage::system("You are helpful"),
-    ChatMessage::user("Hello!")
-]).await?;
-
-// Embedding API
-let embedding = client.embed("text to embed").await?;
-```
+**An attacker would need AMD's private keys to forge attestation.**
 
 ## Examples
 
@@ -190,3 +215,9 @@ Contributions welcome! Please ensure all tests pass:
 cargo test
 cargo run --example full_verification
 ```
+
+## Related
+
+- [Tinfoil Documentation](https://docs.tinfoil.sh)
+- [Confidential Model Router](https://github.com/tinfoilsh/confidential-model-router)
+- [Tinfoil Verifier (Go)](https://github.com/tinfoilsh/verifier)
