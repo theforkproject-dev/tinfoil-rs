@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tinfoil = { git = "https://github.com/anthropics/tinfoil-rs" }
+tinfoil = { git = "https://github.com/theforkproject-dev/tinfoil-rs" }
 ```
 
 ## Quick Start
