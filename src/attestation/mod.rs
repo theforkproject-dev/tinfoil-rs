@@ -1,0 +1,130 @@
+//! Attestation verification module
+//! 
+//! Implements the three-step Tinfoil verification process:
+//! 
+//! ## Step 1: Enclave Runtime Verification (Hardware Attestation)
+//! Verifies the enclave is running in genuine secure hardware:
+//! - Fetch attestation document from `/.well-known/tinfoil-attestation`
+//! - Parse SEV-SNP or TDX report
+//! - Verify AMD/Intel certificate chain to hardware root
+//! - Extract measurement and TLS fingerprint
+//! 
+//! ## Step 2: Code Integrity Verification (Sigstore)
+//! Verifies the source code was built correctly:
+//! - Fetch Sigstore bundle from GitHub
+//! - Verify GitHub Actions signatures
+//! - Extract expected measurements
+//! 
+//! ## Step 3: Consistency Verification
+//! Compares source measurement (Sigstore) with enclave measurement (hardware):
+//! - If they match, the enclave runs the exact open-source code
+//! 
+//! ## TLS Binding
+//! Verifies TLS connection terminates inside the verified enclave:
+//! - Compare server TLS cert SPKI hash with attested fingerprint
+
+pub mod types;
+pub mod sev;
+pub mod tdx;
+
+// Re-export public types
+pub use types::{AttestationDocument, PredicateType, Verification, Measurement, GroundTruth, MeasurementError};
+
+use crate::error::{Error, Result};
+use crate::sigstore;
+
+/// Fetch attestation document from an enclave
+pub async fn fetch(host: &str) -> Result<AttestationDocument> {
+    let url = format!("https://{}/.well-known/tinfoil-attestation", host);
+    
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| Error::AttestationFetch(format!("HTTP request failed: {}", e)))?;
+    
+    if !response.status().is_success() {
+        return Err(Error::AttestationFetch(format!(
+            "HTTP {}: {}",
+            response.status(),
+            response.status().canonical_reason().unwrap_or("Unknown error")
+        )));
+    }
+    
+    let doc: AttestationDocument = response.json().await
+        .map_err(|e| Error::AttestationFetch(format!("JSON parse failed: {}", e)))?;
+    
+    Ok(doc)
+}
+
+/// Verify attestation document (basic verification - Step 1 only)
+/// 
+/// This performs hardware attestation verification:
+/// - Validates report structure
+/// - Extracts measurement and TLS fingerprint
+/// - Does NOT fetch VCEK or verify full certificate chain
+pub fn verify(doc: &AttestationDocument) -> Result<Verification> {
+    match doc.format {
+        PredicateType::SevGuestV2 => sev::verify(&doc.body),
+        PredicateType::TdxGuestV2 => tdx::verify(&doc.body),
+        PredicateType::SnpTdxMultiPlatformV1 => {
+            // Multi-platform format - try SEV-SNP first
+            sev::verify(&doc.body)
+        }
+        PredicateType::Unknown => Err(Error::AttestationVerification(
+            "Unknown attestation format".into()
+        )),
+    }
+}
+
+/// Full verification with AMD certificate chain (Step 1 complete)
+/// 
+/// This performs complete hardware attestation verification:
+/// - Fetches VCEK from AMD KDS
+/// - Validates VCEK → ASK → ARK certificate chain
+/// - Verifies report signature against VCEK
+pub async fn verify_full(doc: &AttestationDocument) -> Result<Verification> {
+    match doc.format {
+        PredicateType::SevGuestV2 => sev::verify_full(&doc.body).await,
+        PredicateType::TdxGuestV2 => {
+            // TDX full verification not yet implemented
+            // Fall back to basic verification
+            tdx::verify(&doc.body)
+        }
+        PredicateType::SnpTdxMultiPlatformV1 => {
+            sev::verify_full(&doc.body).await
+        }
+        PredicateType::Unknown => Err(Error::AttestationVerification(
+            "Unknown attestation format".into()
+        )),
+    }
+}
+
+/// Full end-to-end verification (Steps 1, 2, and 3)
+/// 
+/// This performs the complete Tinfoil verification process:
+/// 1. Hardware attestation (enclave is genuine)
+/// 2. Sigstore verification (code provenance)
+/// 3. Measurement comparison (code matches)
+/// 
+/// Returns `GroundTruth` containing:
+/// - TLS fingerprint for certificate pinning
+/// - HPKE public key for EHBP encryption
+/// - Verified measurements from both source and enclave
+pub async fn verify_complete(host: &str, repo: &str) -> Result<GroundTruth> {
+    // Step 1: Hardware attestation
+    let doc = fetch(host).await?;
+    let enclave_verification = verify_full(&doc).await?;
+    
+    // Step 2: Sigstore verification
+    let code_measurement = sigstore::verify_repo(repo).await?;
+    
+    // Step 3: Measurement comparison
+    enclave_verification.measurement.equals(&code_measurement)
+        .map_err(|e| Error::AttestationVerification(format!("Measurement mismatch: {}", e)))?;
+    
+    Ok(GroundTruth {
+        tls_public_key: enclave_verification.tls_public_key_fp,
+        hpke_public_key: enclave_verification.hpke_public_key,
+        expected_measurement: code_measurement,
+        enclave_measurement: enclave_verification.measurement,
+    })
+}

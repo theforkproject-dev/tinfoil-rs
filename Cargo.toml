@@ -1,0 +1,60 @@
+[package]
+name = "tinfoil"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client for Tinfoil secure enclaves with hardware attestation verification"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# TLS 
+rustls = "0.23"
+webpki-roots = "0.26"
+tokio-rustls = "0.26"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# AMD SEV-SNP attestation with crypto verification (no OpenSSL)
+sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+
+# Crypto primitives
+sha2 = "0.10"
+x509-cert = "0.2"
+der = "0.7"
+p384 = "0.13"
+p256 = "0.13"  # For Fulcio certificate ECDSA (P-256/secp256r1)
+ecdsa = { version = "0.16", features = ["verifying"] }
+
+# RSA for certificate chain verification (AMD certs use RSA-PSS)
+rsa = "0.9"
+
+# PEM parsing
+pem = "3"
+
+# Compression
+flate2 = "1"
+
+# Base64 decoding
+base64 = "0.22"
+
+# Error handling
+thiserror = "1"
+
+# Hex encoding
+hex = "0.4"
+
+# Sigstore verification (Step 2)
+sigstore = { version = "0.13", default-features = false, features = ["sigstore-trust-root", "bundle", "verify", "rustls-tls"] }
+
+# Regex for certificate identity matching
+regex = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
