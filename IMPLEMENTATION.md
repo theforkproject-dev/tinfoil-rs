@@ -1,5 +1,7 @@
 # Tinfoil Rust SDK - Implementation Summary
 
+**Repository:** https://github.com/theforkproject-dev/tinfoil-rs
+
 ## Project Status: ✅ Production-Ready
 
 A zero-dependency (no OpenSSL) Rust client for Tinfoil secure enclaves with **full cryptographic verification** of both hardware attestation and code provenance.
